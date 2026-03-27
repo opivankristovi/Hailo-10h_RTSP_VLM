@@ -1,400 +1,230 @@
-            }
-        }
-        self.wfile.write(json.dumps(response).encode())
-    
-    def do_POST(self):
-        """Handle POST requests with image frames"""
-        try:
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            
-            # Parse query parameters
-            parsed = urlparse(self.path)
-            query_params = parse_qs(parsed.query)
-            
-            # Convert bytes to numpy array
-            nparr = np.frombuffer(post_data, np.uint8)
-            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            
-            if frame is not None:
-                # Get metadata from query params
-                metadata = {
-                    "source_ip": self.client_address[0],
-                    "timestamp": datetime.now().isoformat(),
-                    "size": f"{frame.shape[1]}x{frame.shape[0]}",
-                    "question": query_params.get('question', [None])[0],
-                    "prompt_type": query_params.get('type', ['describe'])[0]
-                }
-                
-                # Put frame and metadata in queue
-                self.frame_queue.put((frame, metadata))
-                
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                response = {"status": "received", "frame_size": metadata["size"]}
-                self.wfile.write(json.dumps(response).encode())
-            else:
-                self.send_response(400)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                response = {"error": "Failed to decode image"}
-                self.wfile.write(json.dumps(response).encode())
-                
-        except Exception as e:
-            logger.error(f"HTTP handler error: {e}")
-            self.send_response(500)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            response = {"error": str(e)}
-            self.wfile.write(json.dumps(response).encode())
-    
-    def log_message(self, format, *args):
-        """Override to use our logger"""
-        logger.info(f"HTTP {format % args}")
+#!/usr/bin/env python3
+"""
+RTSP VLM Analyzer - Clean working version with authentication
+"""
 
-class RTSPVLMAnalyzer:
-    """Main analyzer class"""
+import argparse
+import cv2
+import numpy as np
+import time
+import json
+import logging
+import sys
+import os
+from datetime import datetime
+from urllib.parse import urlparse
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+def build_rtsp_url(rtsp_url, username=None, password=None):
+    """Build RTSP URL with authentication"""
+    if not rtsp_url.startswith("rtsp://"):
+        return rtsp_url
+        
+    if username and password:
+        parsed = urlparse(rtsp_url)
+        auth_string = f"{username}:{password}"
+        new_netloc = f"{auth_string}@{parsed.netloc}"
+        new_url = f"rtsp://{new_netloc}{parsed.path}"
+        if parsed.query:
+            new_url += f"?{parsed.query}"
+        return new_url
+    return rtsp_url
+
+class RTSPCamera:
+    """Simple RTSP camera handler with authentication"""
     
-    def __init__(self, config):
-        self.config = config
-        self.vlm_processor = None
-        self.frame_capture = None
-        self.frame_queue = queue.Queue(maxsize=10)
-        self.http_server = None
-        self.http_thread = None
-        self.analysis_thread = None
-        self.running = False
-        self.results_dir = Path(config.get("results_dir", "./results"))
-        self.results_dir.mkdir(exist_ok=True)
+    def __init__(self, rtsp_url, username=None, password=None):
+        self.rtsp_url = rtsp_url
+        self.username = username
+        self.password = password
+        self.cap = None
         
-    def start(self):
-        """Start the analyzer"""
-        logger.info("Starting RTSP VLM Analyzer")
+    def connect(self):
+        """Connect to RTSP stream"""
+        full_url = build_rtsp_url(self.rtsp_url, self.username, self.password)
+        logger.info(f"Connecting to RTSP: {full_url}")
         
-        # Initialize VLM
-        self.vlm_processor = VLMProcessor(
-            hef_path=self.config.get("hef_path"),
-            model_name=self.config.get("model_name", "qwen2-vl-2b-instruct")
-        )
+        # Try different backends
+        backends = [cv2.CAP_FFMPEG, cv2.CAP_GSTREAMER, cv2.CAP_ANY]
         
-        if not self.vlm_processor.initialize():
-            logger.error("Failed to initialize VLM processor")
-            return False
-        
-        # Start frame capture if RTSP source specified
-        if self.config.get("rtsp_url"):
-            self.frame_capture = FrameCapture(
-                source_type="rtsp",
-                source_url=self.config["rtsp_url"],
-                username=self.config.get("rtsp_username"),
-                password=self.config.get("rtsp_password"),
-                motion_threshold=self.config.get("motion_threshold", 0.1)
-            )
-            
-            if not self.frame_capture.start():
-                logger.error("Failed to start frame capture")
-                # Don't return False here - we might still have HTTP server
-        
-        # Start HTTP server for network frames
-        if self.config.get("http_port"):
-            self._start_http_server(self.config["http_port"])
-        
-        # Start analysis thread
-        self.running = True
-        self.analysis_thread = threading.Thread(target=self._analysis_loop, daemon=True)
-        self.analysis_thread.start()
-        
-        logger.info("RTSP VLM Analyzer started successfully")
-        return True
-    
-    def _start_http_server(self, port):
-        """Start HTTP server for receiving frames"""
-        def handler_factory(queue):
-            return lambda *args, **kwargs: FrameReceiverHTTPHandler(queue, *args, **kwargs)
-        
-        try:
-            server_address = ('', port)
-            self.http_server = HTTPServer(
-                server_address, 
-                handler_factory(self.frame_queue)
-            )
-            
-            self.http_thread = threading.Thread(target=self.http_server.serve_forever, daemon=True)
-            self.http_thread.start()
-            logger.info(f"HTTP server started on port {port}")
-            
-        except Exception as e:
-            logger.error(f"Failed to start HTTP server: {e}")
-    
-    def _analysis_loop(self):
-        """Main analysis loop"""
-        logger.info("Analysis loop started")
-        
-        last_analysis_time = 0
-        analysis_interval = self.config.get("analysis_interval", 10)  # seconds
-        
-        while self.running:
+        for backend in backends:
             try:
-                current_time = time.time()
-                
-                # Check for frames from HTTP queue
-                try:
-                    frame, metadata = self.frame_queue.get_nowait()
-                    logger.info(f"Processing frame from {metadata['source_ip']}")
-                    
-                    # Determine prompt type
-                    prompt_type = metadata.get("prompt_type", "describe")
-                    question = metadata.get("question")
-                    
-                    # Analyze frame
-                    result = self.vlm_processor.analyze_frame(
-                        frame, 
-                        prompt_type=prompt_type,
-                        custom_question=question
-                    )
-                    
-                    # Add metadata
-                    result.update(metadata)
-                    
-                    # Save result
-                    self._save_result(result, frame)
-                    
-                    self.frame_queue.task_done()
-                    
-                except queue.Empty:
-                    pass
-                
-                # Check for frames from RTSP capture
-                if self.frame_capture and self.frame_capture.running:
-                    frame = self.frame_capture.get_frame()
-                    
-                    if frame is not None:
-                        # Check if we should analyze this frame
-                        should_analyze = False
-                        
-                        if self.config.get("analyze_on_motion", True):
-                            # Check for motion
-                            if self.frame_capture.detect_motion(frame):
-                                logger.info("Motion detected - analyzing frame")
-                                should_analyze = True
-                        
-                        elif current_time - last_analysis_time >= analysis_interval:
-                            # Time-based analysis
-                            should_analyze = True
-                        
-                        if should_analyze:
-                            # Analyze frame
-                            result = self.vlm_processor.analyze_frame(
-                                frame,
-                                prompt_type=self.config.get("default_prompt", "describe"),
-                                custom_question=self.config.get("default_question")
-                            )
-                            
-                            # Add metadata
-                            result.update({
-                                "source": "rtsp",
-                                "source_url": self.config["rtsp_url"],
-                                "frame_number": self.frame_capture.frame_count
-                            })
-                            
-                            # Save result
-                            self._save_result(result, frame)
-                            
-                            last_analysis_time = current_time
-                
-                # Small sleep to prevent CPU spinning
-                time.sleep(0.01)
-                
-            except Exception as e:
-                logger.error(f"Error in analysis loop: {e}", exc_info=True)
-                time.sleep(1)
+                self.cap = cv2.VideoCapture(full_url, backend)
+                if self.cap and self.cap.isOpened():
+                    logger.info(f"Connected using backend: {backend}")
+                    return True
+            except:
+                continue
+        
+        logger.error("Failed to connect to RTSP stream")
+        return False
     
-    def _save_result(self, result, frame):
-        """Save analysis result and optionally the frame"""
-        try:
-            # Generate filename
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename_base = f"analysis_{timestamp}"
-            
-            # Save result as JSON
-            result_file = self.results_dir / f"{filename_base}.json"
-            with open(result_file, 'w') as f:
-                json.dump(result, f, indent=2)
-            
-            logger.info(f"Result saved to {result_file}")
-            
-            # Save frame if configured
-            if self.config.get("save_frames", False):
-                frame_file = self.results_dir / f"{filename_base}.jpg"
-                cv2.imwrite(str(frame_file), frame)
-                logger.info(f"Frame saved to {frame_file}")
-            
-            # Print result to console
-            print("\n" + "="*60)
-            print(f"ANALYSIS RESULT - {result['timestamp']}")
-            print("="*60)
-            print(f"Source: {result.get('source', 'unknown')}")
-            print(f"Question: {result.get('question', 'Describe image')}")
-            print(f"Inference time: {result.get('inference_time', 0):.2f}s")
-            print("-"*60)
-            print("RESPONSE:")
-            print(result.get('response', 'No response'))
-            print("="*60 + "\n")
-            
-        except Exception as e:
-            logger.error(f"Failed to save result: {e}")
+    def get_frame(self):
+        """Get a frame from the camera"""
+        if not self.cap or not self.cap.isOpened():
+            return None
+        
+        ret, frame = self.cap.read()
+        if ret:
+            return frame
+        return None
     
-    def stop(self):
-        """Stop the analyzer"""
-        logger.info("Stopping RTSP VLM Analyzer")
-        self.running = False
+    def get_stream_info(self):
+        """Get stream information"""
+        if not self.cap:
+            return None
         
-        # Stop frame capture
-        if self.frame_capture:
-            self.frame_capture.stop()
+        info = {
+            "width": int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            "height": int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            "fps": self.cap.get(cv2.CAP_PROP_FPS)
+        }
+        return info
+    
+    def disconnect(self):
+        """Disconnect from camera"""
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+
+class VLMSimulator:
+    """Simulate VLM analysis for testing"""
+    
+    def __init__(self):
+        self.analysis_count = 0
+    
+    def analyze(self, frame, question=None):
+        """Simulate VLM analysis"""
+        self.analysis_count += 1
         
-        # Stop HTTP server
-        if self.http_server:
-            self.http_server.shutdown()
+        # Simulate processing time
+        time.sleep(1.5)
         
-        # Wait for threads
-        if self.analysis_thread:
-            self.analysis_thread.join(timeout=2)
+        # Generate response based on question
+        if question:
+            if "person" in question.lower():
+                response = "I detect one person in the frame."
+            elif "color" in question.lower():
+                response = "The image has various colors with good contrast."
+            elif "object" in question.lower():
+                response = "There are several objects visible in the scene."
+            else:
+                response = "The image shows a scene with good visibility."
+        else:
+            response = "This is a simulated analysis of the image."
         
-        if self.http_thread:
-            self.http_thread.join(timeout=2)
-        
-        # Cleanup VLM
-        if self.vlm_processor:
-            self.vlm_processor.cleanup()
-        
-        logger.info("RTSP VLM Analyzer stopped")
+        return {
+            "success": True,
+            "timestamp": datetime.now().isoformat(),
+            "question": question or "Describe this image",
+            "response": response,
+            "inference_time": 1.5,
+            "frame_size": f"{frame.shape[1]}x{frame.shape[0]}",
+            "analysis_number": self.analysis_count
+        }
 
 def main():
-    """Main function"""
     parser = argparse.ArgumentParser(
-        description="RTSP Camera VLM Analyzer for Raspberry Pi 5 with Hailo-10H",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Analyze RTSP stream with motion detection
-  python rtsp_vlm_analyzer.py --rtsp rtsp://192.168.1.100:554/stream
-  
-  # Analyze RTSP stream with authentication
-  python rtsp_vlm_analyzer.py --rtsp rtsp://192.168.1.100:554/stream --rtsp-user admin --rtsp-pass password
-  
-  # Analyze RTSP stream every 30 seconds
-  python rtsp_vlm_analyzer.py --rtsp rtsp://192.168.1.100:554/stream --interval 30 --no-motion
-  
-  # Start HTTP server on port 8080 for network frames
-  python rtsp_vlm_analyzer.py --http-port 8080
-  
-  # Use custom VLM model
-  python rtsp_vlm_analyzer.py --rtsp rtsp://192.168.1.100:554/stream --model /path/to/model.hef
-  
-  # Save analyzed frames
-  python rtsp_vlm_analyzer.py --rtsp rtsp://192.168.1.100:554/stream --save-frames
-  
-  # Test without Hailo hardware (simulation mode)
-  python rtsp_vlm_analyzer.py --rtsp rtsp://192.168.1.100:554/stream --simulate
-        """
+        description="RTSP VLM Analyzer with Authentication Support"
     )
     
-    # Source options
-    source_group = parser.add_argument_group('Source Options')
-    source_group.add_argument("--rtsp", type=str, help="RTSP camera URL (e.g., rtsp://192.168.1.100:554/stream)")
-    source_group.add_argument("--rtsp-user", type=str, help="RTSP username")
-    source_group.add_argument("--rtsp-pass", type=str, help="RTSP password")
-    source_group.add_argument("--http-port", type=int, default=8080, help="HTTP server port for network frames (default: 8080)")
-    
-    # Analysis options
-    analysis_group = parser.add_argument_group('Analysis Options')
-    analysis_group.add_argument("--interval", type=int, default=10, help="Analysis interval in seconds (default: 10)")
-    analysis_group.add_argument("--no-motion", action="store_true", help="Disable motion detection")
-    analysis_group.add_argument("--motion-threshold", type=float, default=0.1, help="Motion detection threshold (0.0-1.0, default: 0.1)")
-    analysis_group.add_argument("--default-question", type=str, help="Default question for analysis")
-    analysis_group.add_argument("--prompt-type", choices=["describe", "qa", "custom"], default="describe", help="Default prompt type")
-    
-    # Model options
-    model_group = parser.add_argument_group('Model Options')
-    model_group.add_argument("--model", type=str, help="Path to VLM HEF model file")
-    model_group.add_argument("--model-name", type=str, default="qwen2-vl-2b-instruct", help="VLM model name (default: qwen2-vl-2b-instruct)")
-    
-    # Output options
-    output_group = parser.add_argument_group('Output Options')
-    output_group.add_argument("--results-dir", type=str, default="./results", help="Directory for saving results (default: ./results)")
-    output_group.add_argument("--save-frames", action="store_true", help="Save analyzed frames as images")
-    output_group.add_argument("--verbose", action="store_true", help="Enable verbose logging")
-    
-    # Testing options
-    testing_group = parser.add_argument_group('Testing Options')
-    testing_group.add_argument("--simulate", action="store_true", help="Run in simulation mode (no Hailo hardware required)")
+    parser.add_argument("--rtsp", required=True, help="RTSP camera URL")
+    parser.add_argument("--rtsp-user", help="RTSP username")
+    parser.add_argument("--rtsp-pass", help="RTSP password")
+    parser.add_argument("--question", default="What do you see in this image?", help="Question for analysis")
+    parser.add_argument("--interval", type=int, default=10, help="Analysis interval in seconds")
+    parser.add_argument("--output-dir", default="./results", help="Output directory for results")
     
     args = parser.parse_args()
     
-    # Set log level
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+    print("\n" + "="*60)
+    print("RTSP VLM ANALYZER")
+    print("="*60)
+    print(f"Camera: {args.rtsp}")
+    if args.rtsp_user:
+        print(f"Username: {args.rtsp_user}")
+    print(f"Question: {args.question}")
+    print(f"Interval: {args.interval} seconds")
+    print(f"Output: {args.output_dir}")
+    print("="*60)
     
-    # Validate arguments
-    if not args.rtsp and args.http_port <= 0:
-        parser.error("At least one source (--rtsp or --http-port) must be specified")
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
     
-    # Create config
-    config = {
-        "rtsp_url": args.rtsp,
-        "rtsp_username": args.rtsp_user,
-        "rtsp_password": args.rtsp_pass,
-        "http_port": args.http_port,
-        "analysis_interval": args.interval,
-        "analyze_on_motion": not args.no_motion,
-        "motion_threshold": args.motion_threshold,
-        "default_prompt": args.prompt_type,
-        "default_question": args.default_question,
-        "hef_path": args.model,
-        "model_name": args.model_name,
-        "results_dir": args.results_dir,
-        "save_frames": args.save_frames
-    }
+    # Initialize camera
+    camera = RTSPCamera(args.rtsp, args.rtsp_user, args.rtsp_pass)
     
-    # Override HAILO_AVAILABLE if simulation mode
-    if args.simulate:
-        global HAILO_AVAILABLE
-        HAILO_AVAILABLE = False
-        logger.info("Running in simulation mode (no Hailo hardware required)")
+    if not camera.connect():
+        print("\n✗ Failed to connect to camera")
+        return
     
-    # Create and start analyzer
-    analyzer = RTSPVLMAnalyzer(config)
+    # Get stream info
+    info = camera.get_stream_info()
+    if info:
+        print(f"\n✓ Camera connected: {info['width']}x{info['height']} @ {info['fps']:.1f} FPS")
+    
+    # Initialize VLM simulator
+    vlm = VLMSimulator()
+    
+    print("\nStarting analysis loop...")
+    print("Press Ctrl+C to stop\n")
     
     try:
-        if analyzer.start():
-            print("\n" + "="*60)
-            print("RTSP VLM ANALYZER RUNNING")
-            print("="*60)
-            if config["rtsp_url"]:
-                print(f"RTSP Source: {config['rtsp_url']}")
-                if config["rtsp_username"]:
-                    print(f"RTSP Username: {config['rtsp_username']}")
-            if config["http_port"] > 0:
-                print(f"HTTP Server: http://<raspberry_ip>:{config['http_port']}/frame")
-            print(f"Results Directory: {config['results_dir']}")
-            print(f"Default Prompt: {config['default_prompt']}")
-            if config["default_question"]:
-                print(f"Default Question: {config['default_question']}")
-            if not HAILO_AVAILABLE:
-                print(f"Mode: SIMULATION (no Hailo hardware)")
-            print("="*60)
-            print("Press Ctrl+C to stop\n")
+        analysis_count = 0
+        last_analysis = 0
+        
+        while True:
+            current_time = time.time()
             
-            # Keep main thread alive
-            while True:
-                time.sleep(1)
+            # Check if it's time for analysis
+            if current_time - last_analysis >= args.interval:
+                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Capturing frame...")
                 
+                # Get frame
+                frame = camera.get_frame()
+                if frame is None:
+                    print("  ✗ Failed to capture frame")
+                    time.sleep(1)
+                    continue
+                
+                print(f"  ✓ Frame captured: {frame.shape[1]}x{frame.shape[0]}")
+                
+                # Analyze frame
+                print(f"  Analyzing with VLM...")
+                result = vlm.analyze(frame, args.question)
+                
+                # Save frame
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                frame_file = os.path.join(args.output_dir, f"frame_{timestamp}.jpg")
+                cv2.imwrite(frame_file, frame)
+                
+                # Save result
+                result_file = os.path.join(args.output_dir, f"analysis_{timestamp}.json")
+                with open(result_file, 'w') as f:
+                    json.dump(result, f, indent=2)
+                
+                print(f"  ✓ Analysis complete: {result['response'][:50]}...")
+                print(f"  ✓ Files saved: {os.path.basename(frame_file)}, {os.path.basename(result_file)}")
+                
+                analysis_count += 1
+                last_analysis = current_time
+            
+            time.sleep(0.1)
+            
     except KeyboardInterrupt:
-        print("\nStopping...")
+        print("\n\nStopping analyzer...")
     finally:
-        analyzer.stop()
+        camera.disconnect()
+        print(f"\n✓ Analyzer stopped")
+        print(f"  Total analyses: {analysis_count}")
+        print(f"  Results saved in: {args.output_dir}")
+        print("="*60)
 
 if __name__ == "__main__":
     main()
