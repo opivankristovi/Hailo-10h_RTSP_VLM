@@ -1,3 +1,130 @@
+            }
+        }
+        self.wfile.write(json.dumps(response).encode())
+    
+    def do_POST(self):
+        """Handle POST requests with image frames"""
+        try:
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            
+            # Parse query parameters
+            parsed = urlparse(self.path)
+            query_params = parse_qs(parsed.query)
+            
+            # Convert bytes to numpy array
+            nparr = np.frombuffer(post_data, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if frame is not None:
+                # Get metadata from query params
+                metadata = {
+                    "source_ip": self.client_address[0],
+                    "timestamp": datetime.now().isoformat(),
+                    "size": f"{frame.shape[1]}x{frame.shape[0]}",
+                    "question": query_params.get('question', [None])[0],
+                    "prompt_type": query_params.get('type', ['describe'])[0]
+                }
+                
+                # Put frame and metadata in queue
+                self.frame_queue.put((frame, metadata))
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                response = {"status": "received", "frame_size": metadata["size"]}
+                self.wfile.write(json.dumps(response).encode())
+            else:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                response = {"error": "Failed to decode image"}
+                self.wfile.write(json.dumps(response).encode())
+                
+        except Exception as e:
+            logger.error(f"HTTP handler error: {e}")
+            self.send_response(500)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            response = {"error": str(e)}
+            self.wfile.write(json.dumps(response).encode())
+    
+    def log_message(self, format, *args):
+        """Override to use our logger"""
+        logger.info(f"HTTP {format % args}")
+
+class RTSPVLMAnalyzer:
+    """Main analyzer class"""
+    
+    def __init__(self, config):
+        self.config = config
+        self.vlm_processor = None
+        self.frame_capture = None
+        self.frame_queue = queue.Queue(maxsize=10)
+        self.http_server = None
+        self.http_thread = None
+        self.analysis_thread = None
+        self.running = False
+        self.results_dir = Path(config.get("results_dir", "./results"))
+        self.results_dir.mkdir(exist_ok=True)
+        
+    def start(self):
+        """Start the analyzer"""
+        logger.info("Starting RTSP VLM Analyzer")
+        
+        # Initialize VLM
+        self.vlm_processor = VLMProcessor(
+            hef_path=self.config.get("hef_path"),
+            model_name=self.config.get("model_name", "qwen2-vl-2b-instruct")
+        )
+        
+        if not self.vlm_processor.initialize():
+            logger.error("Failed to initialize VLM processor")
+            return False
+        
+        # Start frame capture if RTSP source specified
+        if self.config.get("rtsp_url"):
+            self.frame_capture = FrameCapture(
+                source_type="rtsp",
+                source_url=self.config["rtsp_url"],
+                username=self.config.get("rtsp_username"),
+                password=self.config.get("rtsp_password"),
+                motion_threshold=self.config.get("motion_threshold", 0.1)
+            )
+            
+            if not self.frame_capture.start():
+                logger.error("Failed to start frame capture")
+                # Don't return False here - we might still have HTTP server
+        
+        # Start HTTP server for network frames
+        if self.config.get("http_port"):
+            self._start_http_server(self.config["http_port"])
+        
+        # Start analysis thread
+        self.running = True
+        self.analysis_thread = threading.Thread(target=self._analysis_loop, daemon=True)
+        self.analysis_thread.start()
+        
+        logger.info("RTSP VLM Analyzer started successfully")
+        return True
+    
+    def _start_http_server(self, port):
+        """Start HTTP server for receiving frames"""
+        def handler_factory(queue):
+            return lambda *args, **kwargs: FrameReceiverHTTPHandler(queue, *args, **kwargs)
+        
+        try:
+            server_address = ('', port)
+            self.http_server = HTTPServer(
+                server_address, 
+                handler_factory(self.frame_queue)
+            )
+            
+            self.http_thread = threading.Thread(target=self.http_server.serve_forever, daemon=True)
+            self.http_thread.start()
+            logger.info(f"HTTP server started on port {port}")
+            
+        except Exception as e:
             logger.error(f"Failed to start HTTP server: {e}")
     
     def _analysis_loop(self):
@@ -154,6 +281,9 @@ Examples:
   # Analyze RTSP stream with motion detection
   python rtsp_vlm_analyzer.py --rtsp rtsp://192.168.1.100:554/stream
   
+  # Analyze RTSP stream with authentication
+  python rtsp_vlm_analyzer.py --rtsp rtsp://192.168.1.100:554/stream --rtsp-user admin --rtsp-pass password
+  
   # Analyze RTSP stream every 30 seconds
   python rtsp_vlm_analyzer.py --rtsp rtsp://192.168.1.100:554/stream --interval 30 --no-motion
   
@@ -165,12 +295,17 @@ Examples:
   
   # Save analyzed frames
   python rtsp_vlm_analyzer.py --rtsp rtsp://192.168.1.100:554/stream --save-frames
+  
+  # Test without Hailo hardware (simulation mode)
+  python rtsp_vlm_analyzer.py --rtsp rtsp://192.168.1.100:554/stream --simulate
         """
     )
     
     # Source options
     source_group = parser.add_argument_group('Source Options')
     source_group.add_argument("--rtsp", type=str, help="RTSP camera URL (e.g., rtsp://192.168.1.100:554/stream)")
+    source_group.add_argument("--rtsp-user", type=str, help="RTSP username")
+    source_group.add_argument("--rtsp-pass", type=str, help="RTSP password")
     source_group.add_argument("--http-port", type=int, default=8080, help="HTTP server port for network frames (default: 8080)")
     
     # Analysis options
@@ -192,6 +327,10 @@ Examples:
     output_group.add_argument("--save-frames", action="store_true", help="Save analyzed frames as images")
     output_group.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     
+    # Testing options
+    testing_group = parser.add_argument_group('Testing Options')
+    testing_group.add_argument("--simulate", action="store_true", help="Run in simulation mode (no Hailo hardware required)")
+    
     args = parser.parse_args()
     
     # Set log level
@@ -205,6 +344,8 @@ Examples:
     # Create config
     config = {
         "rtsp_url": args.rtsp,
+        "rtsp_username": args.rtsp_user,
+        "rtsp_password": args.rtsp_pass,
         "http_port": args.http_port,
         "analysis_interval": args.interval,
         "analyze_on_motion": not args.no_motion,
@@ -217,6 +358,12 @@ Examples:
         "save_frames": args.save_frames
     }
     
+    # Override HAILO_AVAILABLE if simulation mode
+    if args.simulate:
+        global HAILO_AVAILABLE
+        HAILO_AVAILABLE = False
+        logger.info("Running in simulation mode (no Hailo hardware required)")
+    
     # Create and start analyzer
     analyzer = RTSPVLMAnalyzer(config)
     
@@ -227,12 +374,16 @@ Examples:
             print("="*60)
             if config["rtsp_url"]:
                 print(f"RTSP Source: {config['rtsp_url']}")
+                if config["rtsp_username"]:
+                    print(f"RTSP Username: {config['rtsp_username']}")
             if config["http_port"] > 0:
                 print(f"HTTP Server: http://<raspberry_ip>:{config['http_port']}/frame")
             print(f"Results Directory: {config['results_dir']}")
             print(f"Default Prompt: {config['default_prompt']}")
             if config["default_question"]:
                 print(f"Default Question: {config['default_question']}")
+            if not HAILO_AVAILABLE:
+                print(f"Mode: SIMULATION (no Hailo hardware)")
             print("="*60)
             print("Press Ctrl+C to stop\n")
             
