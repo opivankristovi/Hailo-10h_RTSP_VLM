@@ -1,0 +1,147 @@
+# Hailo-10h_RTSP_VLM Configuration Example
+# Copy to config.yaml and modify as needed
+
+# RTSP Camera Configuration
+rtsp:
+  url: "rtsp://192.168.1.100:554/stream"
+  username: "admin"
+  password: "password"  # Store securely in production
+  buffer_size: 1  # Reduce latency
+
+# HTTP Server Configuration
+http:
+  port: 8080
+  host: "0.0.0.0"  # Listen on all interfaces
+  max_queue_size: 10
+
+# Analysis Configuration
+analysis:
+  default_prompt_type: "describe"  # describe, qa, or custom
+  default_question: "Describe this image in detail"
+  interval_seconds: 10  # Time-based analysis interval
+  motion_detection:
+    enabled: true
+    threshold: 0.1  # 0.0-1.0, lower = more sensitive
+    min_area: 500  # Minimum motion area in pixels
+  
+  vlm_parameters:
+    temperature: 0.1  # Lower = more deterministic
+    max_tokens: 200
+    seed: 42  # For reproducibility
+
+# VLM Model Configuration
+model:
+  name: "qwen2-vl-2b-instruct"
+  hef_path: "/usr/share/hailo-ollama/models/blob/Qwen2-VL-2B-Instruct.hef"
+  auto_download: true  # Download if not found
+
+# Output Configuration
+output:
+  results_dir: "./results"
+  save_frames: false  # Save analyzed frames as images
+  save_format: "jpg"  # jpg or png
+  log_level: "INFO"   # DEBUG, INFO, WARNING, ERROR
+  
+  # JSON output structure
+  json_fields:
+    - timestamp
+    - prompt_type
+    - question
+    - response
+    - inference_time
+    - frame_size
+    - source
+    - motion_detected
+
+# Performance Configuration
+performance:
+  inference_timeout: 60  # Seconds
+  max_concurrent: 1      # Maximum concurrent inferences
+  frame_resize: [336, 336]  # VLM input size
+  
+  # Resource limits
+  max_memory_mb: 2048
+  max_cpu_percent: 80
+
+# Network Configuration
+network:
+  retry_attempts: 3
+  retry_delay: 2  # Seconds
+  timeout: 30     # Seconds for HTTP requests
+  
+  # Security (basic)
+  allowed_ips:  # Leave empty for all
+    - "192.168.1.0/24"
+    - "10.0.0.0/8"
+
+# Camera Presets (multiple cameras)
+cameras:
+  front_door:
+    rtsp_url: "rtsp://192.168.1.101:554/stream"
+    question: "Who is at the front door?"
+    motion_threshold: 0.05
+    
+  backyard:
+    rtsp_url: "rtsp://192.168.1.102:554/stream"
+    question: "Are there any animals in the backyard?"
+    interval_seconds: 300  # Every 5 minutes
+    
+  living_room:
+    rtsp_url: "rtsp://192.168.1.103:554/stream"
+    question: "What activities are happening in the living room?"
+    save_frames: true
+
+# Alerting Configuration (example)
+alerts:
+  enabled: false
+  telegram:
+    bot_token: "YOUR_BOT_TOKEN"
+    chat_id: "YOUR_CHAT_ID"
+  
+  email:
+    smtp_server: "smtp.gmail.com"
+    smtp_port: 587
+    username: "your_email@gmail.com"
+    password: "your_password"
+    recipients:
+      - "alert@example.com"
+  
+  # Alert triggers
+  triggers:
+    - keyword: "person"
+      action: "log"  # log, email, telegram
+      cooldown: 300  # Seconds between alerts
+    
+    - keyword: "vehicle"
+      action: "telegram"
+      cooldown: 600
+
+# Integration Configuration
+integrations:
+  home_assistant:
+    enabled: false
+    url: "http://homeassistant:8123"
+    token: "YOUR_LONG_LIVED_TOKEN"
+    
+  mqtt:
+    enabled: false
+    broker: "mqtt://localhost:1883"
+    topic: "hailo/vlm/results"
+    
+  database:
+    enabled: false
+    type: "sqlite"  # sqlite, postgresql, mysql
+    path: "./results.db"  # For sqlite
+
+# System Monitoring
+monitoring:
+  enabled: true
+  metrics_port: 9090  # Prometheus metrics endpoint
+  health_check: "/health"
+  
+  # What to monitor
+  monitor:
+    - inference_time
+    - frame_rate
+    - memory_usage
+    - device_temperature
